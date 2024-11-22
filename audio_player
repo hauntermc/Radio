@@ -1,0 +1,586 @@
+import heapq
+import subprocess
+import sys
+
+import pyaudio
+import numpy as np
+from pydub import AudioSegment
+import threading
+import time
+import queue
+import logging
+import wave
+import os
+
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+class AudioPlayer:
+    def __init__(self):
+        self.radio_url = 'https://27323.live.streamtheworld.com/PARADISO.mp3?v=1725900143261'
+        self.FFMPEG_BIN = r"C:\Users\Detel\Documents\ffmpeg\bin\ffmpeg.exe"
+        self.is_playing = False
+        self.process = None
+        self.audio_stream = None
+        self.p = pyaudio.PyAudio()
+        self.message_audio = None
+        self.is_message_playing = False
+        self.radio_volume = 1.0
+        self.message_volume = 1.0
+        self.transition_duration = 1.5
+        self.FADE_STEPS = 150
+        self.CHUNK_SIZE = 1024
+        self.SAMPLE_RATE = 44100
+        self.audio_buffer = queue.Queue(maxsize=20)
+        self.buffer_thread = None
+        self.message_buffer = queue.Queue()
+        self.message_thread = None
+        self.stop_event = threading.Event()
+        self.priority_levels = {1: 0.2, 2: 0.4, 3: 0.6, 4: 0.8, 5: 1.0}
+        self.message_queue = []
+        self.message_lock = threading.Lock()
+        self.current_message = None
+        self.message_event = threading.Event()
+        self.radio_paused = False
+        self.scheduler_thread = None
+        self.scheduler_stop_event = threading.Event()
+        self.periodic_messages = {}
+        self.periodic_timer = None
+        self.priority_queues = {1: [], 2: [], 3: [], 4: [], 5: []}
+        self.current_priority = 5  # Começamos com a prioridade mais baixa
+        self.fade_duration = 3.0  # Aumentamos a duração do fade para 3 segundos
+        self.fade_curve = 2  # Ajuste este valor para mudar a curva do fade (2 é uma curva sua
+        self.radio_volume = 1.0
+        self.user_radio_volume = 1.0
+        self.thread_lock = threading.Lock()
+        self.p = None
+        self.initialize_pyaudio()
+        self.threads = []
+        self.message_queues = {1: queue.PriorityQueue(), 2: queue.PriorityQueue(), 3: queue.PriorityQueue(), 4: queue.PriorityQueue(),
+                               5: queue.PriorityQueue()}
+        self.mensagem_atual = None
+        self.fila_mensagens = queue.PriorityQueue()
+        self.thread_processamento = None
+        self.evento_processamento = threading.Event()
+    def initialize_pyaudio(self):
+        if self.p is None:
+            self.p = pyaudio.PyAudio()
+
+    def terminate_pyaudio(self):
+        if self.p is not None:
+            self.p.terminate()
+            self.p = None
+
+    def play_audio(self):
+        self.initialize_pyaudio()
+        if self.is_playing:
+            logging.info("Já está tocando. Parando a reprodução atual...")
+            self.stop_audio()
+            time.sleep(1)  # Aguarda a limpeza completa
+
+        try:
+            logging.info("Iniciando o streaming do áudio...")
+            self.stop_event.clear()
+            self.process = subprocess.Popen([
+                self.FFMPEG_BIN,
+                "-i", self.radio_url,
+                "-f", "f32le",
+                "-ac", "2",
+                "-ar", str(self.SAMPLE_RATE),
+                "-"
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            self.is_playing = True
+            self.audio_buffer = queue.Queue(maxsize=20)
+            self.buffer_thread = self.create_thread(target=self._fill_buffer)
+
+            self.audio_stream = self.p.open(format=pyaudio.paFloat32,
+                                            channels=2,
+                                            rate=self.SAMPLE_RATE,
+                                            output=True,
+                                            frames_per_buffer=self.CHUNK_SIZE,
+                                            stream_callback=self._callback)
+
+            self.audio_stream.start_stream()
+
+        except Exception as e:
+            logging.error(f"Erro ao reproduzir o áudio: {e}")
+            self.stop_audio()
+    def create_thread(self, target, args=()):
+        thread = threading.Thread(target=target, args=args)
+        self.threads.append(thread)
+        thread.start()
+        return thread
+
+    def check_pyaudio(self):
+        if self.p is None or not isinstance(self.p, pyaudio.PyAudio):
+            logging.warning("PyAudio não inicializado. Inicializando...")
+            self.initialize_pyaudio()
+    def _fill_buffer(self):
+        while not self.stop_event.is_set():
+            if self.audio_buffer.qsize() < 20:
+                data = self.process.stdout.read(self.CHUNK_SIZE * 8)
+                if len(data) == 0:
+                    logging.info("Fim do stream de áudio.")
+                    break
+                self.audio_buffer.put(data)
+            else:
+                time.sleep(0.01)
+
+    def _callback(self, in_data, frame_count, time_info, status):
+        try:
+            if self.stop_event.is_set():
+                return (np.zeros(frame_count * 2, dtype=np.float32).tobytes(), pyaudio.paComplete)
+
+            output = np.zeros(frame_count * 2, dtype=np.float32)
+
+            if self.is_message_playing and not self.message_buffer.empty():
+                try:
+                    message_chunk = self.message_buffer.get_nowait()
+                    if len(message_chunk) < frame_count * 2:
+                        message_chunk = np.pad(message_chunk, ((0, frame_count * 2 - len(message_chunk)), (0, 0)))
+                    output = message_chunk.flatten() * self.message_volume
+                except queue.Empty:
+                    pass
+            elif not self.radio_paused and not self.audio_buffer.empty():
+                try:
+                    radio_chunk = np.frombuffer(self.audio_buffer.get_nowait(), dtype=np.float32)
+                    if len(radio_chunk) < frame_count * 2:
+                        radio_chunk = np.pad(radio_chunk, (0, frame_count * 2 - len(radio_chunk)))
+                    output += radio_chunk * self.radio_volume
+                except queue.Empty:
+                    pass
+
+            output = np.clip(output, -1, 1)
+            return (output.tobytes(), pyaudio.paContinue)
+
+        except Exception as e:
+            logging.error(f"Erro no callback de áudio: {e}")
+            return (np.zeros(frame_count * 2, dtype=np.float32).tobytes(), pyaudio.paContinue)
+
+    def stop_audio(self):
+        logging.info("Parando a reprodução de áudio...")
+        self.stop_event.set()
+        self.scheduler_stop_event.set()
+        self.is_playing = False
+        self.is_message_playing = False
+
+        if self.audio_stream:
+            self.audio_stream.stop_stream()
+            self.audio_stream.close()
+            self.audio_stream = None
+
+        if self.process:
+            self.process.terminate()
+            self.process.wait()  # Espera o processo terminar
+            self.process = None
+
+        if self.buffer_thread and self.buffer_thread.is_alive():
+            self.buffer_thread.join(timeout=1.0)
+
+        if self.message_thread and self.message_thread.is_alive():
+            self.message_thread.join(timeout=1.0)
+
+        self.audio_buffer = queue.Queue(maxsize=20)
+        self.message_buffer = queue.Queue()
+        self.radio_volume = 1.0
+        self.message_volume = 1.0
+
+        logging.info("Reprodução de áudio parada com sucesso")
+
+    def stop_all_threads(self):
+        logging.info("Parando todas as threads")
+        self.scheduler_stop_event.set()
+        self.stop_event.set()
+        for thread in self.threads:
+            if thread.is_alive():
+                thread.join(timeout=1.0)
+        logging.info("Todas as threads foram paradas")
+
+    def pause_audio(self):
+        if self.is_playing:
+            self.stop_audio()
+        else:
+            logging.info("O áudio já está pausado.")
+
+    def play_message(self, arquivo_mensagem, prioridade=3, atraso=0, intervalo=0):
+        try:
+            if not self.is_playing:
+                self.play_audio()
+
+            tempo_agendado = time.time() + atraso
+            info_mensagem = {
+                'arquivo': arquivo_mensagem,
+                'prioridade': prioridade,
+                'intervalo': intervalo,
+                'tempo_agendado': tempo_agendado
+            }
+
+            # Adiciona à fila com prioridade
+            self.fila_mensagens.put((prioridade, tempo_agendado, info_mensagem))
+
+            if intervalo > 0:
+                self.periodic_messages[arquivo_mensagem] = {
+                    'prioridade': prioridade,
+                    'intervalo': intervalo,
+                    'ultima_execucao': time.time() - intervalo,
+                    'proxima_execucao': tempo_agendado
+                }
+
+            # Inicia thread de processamento
+            if not self.thread_processamento or not self.thread_processamento.is_alive():
+                self.thread_processamento = self.create_thread(target=self._processar_fila_mensagens)
+                self.message_event.set()
+
+        except Exception as e:
+            logging.error(f"Erro ao agendar mensagem: {e}")
+
+    def _can_play_message(self, message_file, priority):
+        with self.message_lock:
+            if message_file in self.periodic_messages:
+                info = self.periodic_messages[message_file]
+                current_time = time.time()
+                return current_time >= info['next_play']
+        return True
+
+    def exception_handler(exctype, value, traceback):
+        logging.error("Exceção não tratada:", exc_info=(exctype, value, traceback))
+        sys.__excepthook__(exctype, value, traceback)
+
+    sys.excepthook = exception_handler
+
+    def _schedule_messages(self):
+        logging.info("Iniciando loop de agendamento de mensagens")
+        last_played_message = None
+
+        while not self.scheduler_stop_event.is_set():
+            try:
+                current_time = time.time()
+                message_to_play = None
+                priority_to_play = None
+
+                with self.message_lock:
+                    # Verifica todas as prioridades em ordem (1 é mais alta)
+                    for priority in range(1, 6):
+                        if not self.message_queues[priority].empty():
+                            scheduled_time, message = self.message_queues[priority].queue[0]
+
+                            if current_time >= scheduled_time:
+                                # Verifica se é uma mensagem periódica que já pode tocar novamente
+                                if message in self.periodic_messages:
+                                    info = self.periodic_messages[message]
+                                    if current_time >= info['next_play']:
+                                        message_to_play = self.message_queues[priority].get()[1]
+                                        priority_to_play = priority
+                                        break
+                                else:
+                                    message_to_play = self.message_queues[priority].get()[1]
+                                    priority_to_play = priority
+                                    break
+
+                    if message_to_play:
+                        # Processa a mensagem
+                        self._process_message(message_to_play, priority_to_play)
+                        last_played_message = message_to_play
+
+                        # Reagenda se for periódica
+                        if message_to_play in self.periodic_messages:
+                            info = self.periodic_messages[message_to_play]
+                            next_play = current_time + info['interval']
+                            self.message_queues[info['priority']].put((next_play, message_to_play))
+                            info['last_played'] = current_time
+                            info['next_play'] = next_play
+                            logging.info(
+                                f"Mensagem '{message_to_play}' reagendada para {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(next_play))}")
+
+                time.sleep(0.1)  # Evita consumo excessivo de CPU
+
+            except Exception as e:
+                logging.error(f"Erro no agendador: {e}")
+                logging.exception("Detalhes do erro:")
+
+    def _debug_periodic_messages(self):
+        logging.debug("Estado atual das mensagens periódicas:")
+        with self.message_lock:
+            periodic_messages_copy = dict(self.periodic_messages)
+
+        for message, info in periodic_messages_copy.items():
+            logging.debug(f"  Mensagem: {message}")
+            logging.debug(f"    Prioridade: {info['priority']}")
+            logging.debug(f"    Intervalo: {info['interval']}")
+            logging.debug(
+                f"    Última reprodução: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(info['last_played']))}")
+            logging.debug(
+                f"    Próxima reprodução: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(info['next_play']))}")
+
+    def _debug_message_queues(self):
+        logging.debug("Estado atual das filas de mensagens:")
+        for priority in range(1, 6):
+            queue = self.message_queues[priority]
+            if not queue.empty():
+                logging.debug(f"  Prioridade {priority}:")
+                for scheduled_time, message in queue.queue:
+                    logging.debug(
+                        f"    Mensagem: {message}, Agendada para: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(scheduled_time))}")
+            else:
+                logging.debug(f"  Prioridade {priority}: Vazia")
+
+    def stop_periodic_threads(self):
+        if self.periodic_timer:
+            self.periodic_timer.cancel()
+
+        for timer in threading.enumerate():
+            if isinstance(timer, threading.Timer):
+                timer.cancel()
+    def stop_periodic_message(self, message_file):
+        with self.message_lock:
+            if message_file in self.periodic_messages:
+                info = self.periodic_messages[message_file]
+                del self.periodic_messages[message_file]
+                # Remove a mensagem da fila de prioridade correspondente
+                self.message_queues[info['priority']].queue = [item for item in
+                                                               self.message_queues[info['priority']].queue if
+                                                               item[1] != message_file]
+                logging.info(f"Mensagem periódica '{message_file}' removida da programação")
+        self._debug_message_queues()
+
+    def _processar_fila_mensagens(self):
+        ultimo_arquivo = None
+        while not self.stop_event.is_set():
+            try:
+                if self.fila_mensagens.empty():
+                    time.sleep(0.1)
+                    continue
+
+                tempo_atual = time.time()
+                todas_mensagens = []
+                mensagens_prontas = []
+
+                # Coleta todas as mensagens
+                while not self.fila_mensagens.empty():
+                    msg = self.fila_mensagens.get()
+                    todas_mensagens.append(msg)
+                    if tempo_atual >= msg[1]:
+                        mensagens_prontas.append(msg)
+
+                # Se não há mensagens prontas, recoloca todas e continua
+                if not mensagens_prontas:
+                    for msg in todas_mensagens:
+                        self.fila_mensagens.put(msg)
+                    time.sleep(0.1)
+                    continue
+
+                # Filtra para não repetir a mesma mensagem
+                mensagens_diferentes = [msg for msg in mensagens_prontas if msg[2]['arquivo'] != ultimo_arquivo]
+                if not mensagens_diferentes:
+                    mensagens_diferentes = mensagens_prontas
+
+                # Ordena por prioridade e tempo
+                mensagens_diferentes.sort(key=lambda x: (x[0], x[1]))
+                mensagem_para_tocar = mensagens_diferentes[0]
+                ultimo_arquivo = mensagem_para_tocar[2]['arquivo']
+
+                # Recoloca outras mensagens na fila
+                for msg in todas_mensagens:
+                    if msg != mensagem_para_tocar:
+                        self.fila_mensagens.put(msg)
+
+                # Processa a mensagem
+                info_mensagem = mensagem_para_tocar[2]
+                self.message_event.wait()
+                self._process_message(info_mensagem['arquivo'], info_mensagem['prioridade'])
+
+                # Reagenda se for periódica
+                if info_mensagem['intervalo'] > 0:
+                    proximo_tempo = tempo_atual + info_mensagem['intervalo']
+                    self.fila_mensagens.put((
+                        info_mensagem['prioridade'],
+                        proximo_tempo,
+                        {**info_mensagem, 'tempo_agendado': proximo_tempo}
+                    ))
+
+            except Exception as e:
+                logging.error(f"Erro ao processar fila de mensagens: {e}")
+                time.sleep(0.1)
+
+    def _process_message(self, arquivo_mensagem, prioridade):
+        logging.info(
+            f"Iniciando processamento da mensagem: {arquivo_mensagem} com prioridade {prioridade} às {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # Aguarda mensagem anterior terminar
+        self.message_event.wait()
+        self.message_event.clear()
+        self.is_message_playing = True
+
+        try:
+            # Pausar rádio com fade out
+            if self.is_playing:
+                self._fade_radio(self.radio_volume, 0, self.fade_duration)
+                self.radio_paused = True
+
+            # Tocar mensagem
+            self._load_and_play_message(arquivo_mensagem, prioridade)
+
+            # Retomar rádio com fade in
+            if self.is_playing:
+                self.radio_paused = False
+                self._fade_radio(0, self.user_radio_volume, self.fade_duration)
+
+        except Exception as e:
+            logging.error(f"Erro ao processar mensagem: {e}")
+            logging.exception("Detalhes do erro:")
+        finally:
+            self.is_message_playing = False
+            self.message_event.set()
+            logging.info(f"Finalizado processamento da mensagem: {arquivo_mensagem}")
+
+
+    def _process_next_message(self):
+        with self.message_lock:
+            if self.message_queue:
+                priority, _, message_file = heapq.heappop(self.message_queue)
+                self.current_message = message_file
+                logging.info(f"Iniciando processamento da mensagem: {message_file}")
+                self.message_thread = threading.Thread(target=self._load_and_play_message, args=(message_file, priority))
+                self.message_thread.start()
+            else:
+                self.is_message_playing = False
+                self.current_message = None
+                self._fade_radio(0.2, 1.0, self.transition_duration)
+                self.radio_paused = False
+                self.message_event.set()  # Sinaliza que todas as mensagens foram reproduzidas
+
+    def _load_and_play_message(self, message_file, priority):
+        try:
+            logging.info(f"Iniciando reprodução da mensagem: {message_file}")
+            temp_wav = self._convert_to_wav(message_file)
+
+            with wave.open(temp_wav, 'rb') as wf:
+                # Configurações do áudio
+                channels = wf.getnchannels()
+                sample_width = wf.getsampwidth()
+                framerate = wf.getframerate()
+                n_frames = wf.getnframes()
+
+                # Calcular tamanho do fade
+                fade_duration_frames = int(self.fade_duration * framerate)
+
+                # Ler todo o áudio
+                data = wf.readframes(n_frames)
+                audio_data = np.frombuffer(data, dtype=np.int16)
+                audio_float = audio_data.astype(np.float32) / 32768.0
+
+                # Aplicar fade in
+                fade_in = np.linspace(0, 1, fade_duration_frames) ** 2  # Curva suave
+                audio_float[:fade_duration_frames] *= fade_in
+
+                # Aplicar fade out
+                fade_out = np.linspace(1, 0, fade_duration_frames) ** 2  # Curva suave
+                audio_float[-fade_duration_frames:] *= fade_out
+
+                # Configurar stream para a mensagem
+                stream = self.p.open(
+                    format=self.p.get_format_from_width(sample_width),
+                    channels=channels,
+                    rate=framerate,
+                    output=True
+                )
+
+                # Reproduzir em chunks
+                chunk_size = self.CHUNK_SIZE * channels
+                for i in range(0, len(audio_float), chunk_size):
+                    if self.stop_event.is_set():
+                        break
+                    chunk = audio_float[i:i + chunk_size]
+                    if len(chunk) < chunk_size:
+                        chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
+                    stream.write((chunk * 32768).astype(np.int16).tobytes())
+
+                stream.stop_stream()
+                stream.close()
+
+            logging.info(f"Finalizada a reprodução da mensagem: {message_file}")
+
+        except Exception as e:
+            logging.error(f"Erro ao carregar e reproduzir a mensagem: {e}")
+            logging.exception("Detalhes do erro:")
+        finally:
+            if os.path.exists(temp_wav):
+                os.remove(temp_wav)
+
+
+    def _convert_to_wav(self, input_file):
+        temp_wav = input_file + ".temp.wav"
+        subprocess.call([
+            self.FFMPEG_BIN,
+            "-y",  # Força a sobrescrita
+            "-i", input_file,
+            "-acodec", "pcm_s16le",
+            "-ar", str(self.SAMPLE_RATE),
+            "-ac", "2",
+            temp_wav
+        ])
+        return temp_wav
+
+    def _resample(self, samples, old_rate, new_rate):
+        # Implementação simples de resampling
+        duration = len(samples) / old_rate
+        new_length = int(duration * new_rate)
+        return np.interp(
+            np.linspace(0, duration, new_length, endpoint=False),
+            np.linspace(0, duration, len(samples), endpoint=False),
+            samples
+        )
+
+
+    def set_radio_volume(self, volume):
+        self.user_radio_volume = max(0.0, min(1.0, volume))
+        if not self.is_message_playing:
+            self.radio_volume = self.user_radio_volume
+
+    def _fade_radio(self, start_vol, end_vol, duration):
+        steps = int(self.SAMPLE_RATE * duration / self.CHUNK_SIZE)
+        vol_step = (end_vol - start_vol) / steps
+
+        for _ in range(steps):
+            if self.stop_event.is_set():
+                break
+            self.radio_volume += vol_step
+            self.radio_volume = max(0, min(self.user_radio_volume, self.radio_volume))
+            time.sleep(duration / steps)
+
+    def debug_periodic_messages(self):
+        with self.message_lock:
+            for message, info in self.periodic_messages.items():
+                logging.debug(f"Mensagem: {message}")
+                logging.debug(f"  Prioridade: {info['priority']}")
+                logging.debug(f"  Intervalo: {info['interval']}")
+                logging.debug(f"  Última reprodução: {info['last_played']}")
+                logging.debug(f"  Próxima reprodução: {info['next_play']}")
+
+    def cleanup(self):
+        logging.info("Limpando recursos do AudioPlayer")
+        self.stop_event.set()
+        self.scheduler_stop_event.set()
+        self.stop_periodic_threads()
+
+        if self.periodic_timer:
+            self.periodic_timer.cancel()
+
+        for thread in self.threads:
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+
+        self.stop_audio()
+        self.terminate_pyaudio()
+
+        self.threads.clear()
+        logging.info("Limpeza de recursos concluída")
+
+    def clear_all_messages(self):
+        with self.message_lock:
+            for priority in range(1, 6):
+                self.message_queues[priority] = queue.PriorityQueue()
+            self.periodic_messages.clear()
+        logging.info("Todas as mensagens foram removidas das filas e da programação periódica")
+        self._debug_message_queues()
