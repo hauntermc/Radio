@@ -1,0 +1,268 @@
+import logging
+import sys
+import threading
+from queue import PriorityQueue
+
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QPushButton, QWidget,
+                             QLabel, QSpinBox, QHBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView, QSlider)
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal, QThread
+from audio_player import AudioPlayer
+import os
+
+
+class MessageSchedulerThread(QThread):
+    message_scheduled = pyqtSignal(str, int, int)
+
+    def __init__(self, audio_player, message_file, priority, interval):
+        super().__init__()
+        self.audio_player = audio_player
+        self.message_file = message_file
+        self.priority = priority
+        self.interval = interval
+        self.message_queues = {1: PriorityQueue(), 2: PriorityQueue(), 3: PriorityQueue(), 4: PriorityQueue(),
+                               5: PriorityQueue()}
+        self.current_priority = 5
+
+    def run(self):
+        self.audio_player.play_message(self.message_file, self.priority, self.interval)
+        self.message_scheduled.emit(self.message_file, self.priority, self.interval)
+
+
+class RadioPlayerWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Rádio Player")
+        self.setGeometry(100, 100, 800, 500)
+        self.scheduler_threads = {}
+        self.audio_player = AudioPlayer()
+        self.message_timers = {}
+
+        # Widget e Layout Principal
+        central_widget = QWidget()
+        central_widget.setStyleSheet("background-color: #f3f4f6;")
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setSpacing(20)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+
+        # Controles do Rádio (Card)
+        controls_widget = QWidget()
+        controls_widget.setStyleSheet("""
+            QWidget {
+                background-color: white;
+                border-radius: 8px;
+            }
+            QPushButton {
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+        """)
+        controls_layout = QHBoxLayout(controls_widget)
+        controls_layout.setContentsMargins(20, 15, 20, 15)
+
+        # Botões Play/Pause
+        self.play_button = QPushButton("Play Rádio")
+        self.play_button.setStyleSheet("background-color: #3b82f6; color: white;")
+        self.play_button.clicked.connect(self.play_audio)
+
+        self.pause_button = QPushButton("Pause Rádio")
+        self.pause_button.setStyleSheet("background-color: #6b7280; color: white;")
+        self.pause_button.clicked.connect(self.pause_audio)
+
+        # Controle de Volume
+        volume_widget = QWidget()
+        volume_layout = QHBoxLayout(volume_widget)
+        volume_layout.setContentsMargins(0, 0, 0, 0)
+        volume_label = QLabel("Volume:")
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                background: #e5e7eb;
+                height: 4px;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #3b82f6;
+                width: 16px;
+                margin: -6px 0;
+                border-radius: 8px;
+            }
+        """)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(100)
+        self.volume_slider.valueChanged.connect(self.set_volume)
+
+        # Adiciona os controles ao layout
+        controls_layout.addWidget(self.play_button)
+        controls_layout.addWidget(self.pause_button)
+        controls_layout.addStretch()
+        controls_layout.addWidget(volume_label)
+        controls_layout.addWidget(self.volume_slider)
+
+        # Tabela de Mensagens
+        self.message_table = QTableWidget()
+        self.message_table.setStyleSheet("""
+            QTableWidget {
+                background-color: white;
+                border-radius: 8px;
+                border: none;
+            }
+            QHeaderView::section {
+                background-color: #f8fafc;
+                padding: 8px;
+                border: none;
+                font-weight: bold;
+            }
+            QTableWidget::item {
+                padding: 8px;
+            }
+        """)
+        self.message_table.setColumnCount(6)
+        self.message_table.setHorizontalHeaderLabels(
+            ["Mensagem", "Prioridade", "Tempo (s)", "Status", "Agendar", "Parar"])
+        self.message_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+
+        # Adiciona os widgets ao layout principal
+        main_layout.addWidget(controls_widget)
+        main_layout.addWidget(self.message_table)
+
+        self.setCentralWidget(central_widget)
+        self.load_messages()
+
+    def load_messages(self):
+        message_folder = r"C:\Users\Detel\PycharmProjects\Radio1\messages"
+        audio_extensions = ['.mp3', '.wav', '.ogg']
+        messages = [f for f in os.listdir(message_folder) if any(f.lower().endswith(ext) for ext in audio_extensions)]
+
+        # Aumenta altura das linhas
+        self.message_table.verticalHeader().setDefaultSectionSize(40)
+
+        # Configura tabela
+        self.message_table.setRowCount(len(messages))
+        for row, message in enumerate(messages):
+            # Mensagem
+            message_item = QTableWidgetItem(message)
+            self.message_table.setItem(row, 0, message_item)
+
+            # Prioridade
+            priority_spinbox = QSpinBox()
+            priority_spinbox.setRange(1, 5)
+            priority_spinbox.setValue(0)
+            priority_spinbox.setStyleSheet("""
+                QSpinBox {
+                    background-color: white;
+                    border: 1px solid #ccc;
+                    border-radius: 4px;
+                    min-height: 30px;
+                    min-width: 80px;
+                    padding: 2px 5px;
+                }
+            """)
+            self.message_table.setCellWidget(row, 1, priority_spinbox)
+
+            # Tempo
+            time_spinbox = QSpinBox()
+            time_spinbox.setRange(0, 3600)
+            time_spinbox.setValue(0)
+            time_spinbox.setStyleSheet("""
+                QSpinBox {
+                    background-color: white;
+                    border: 1px solid #ccc;
+                    border-radius: 4px;
+                    min-height: 30px;
+                    min-width: 80px;
+                    padding: 2px 5px;
+                }
+            """)
+            self.message_table.setCellWidget(row, 2, time_spinbox)
+
+            # Status
+            status_item = QTableWidgetItem("Não agendado")
+            status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.message_table.setItem(row, 3, status_item)
+
+            # Botões
+            schedule_button = QPushButton("Agendar")
+            schedule_button.setFixedSize(100, 30)
+            schedule_button.setStyleSheet("""
+                QPushButton {
+                    background-color: #22c55e;
+                    color: white;
+                    border-radius: 4px;
+                    min-height: 30px;
+                    min-width: 100px;
+                }
+            """)
+            schedule_button.clicked.connect(lambda checked, r=row: self.schedule_message(r))
+            self.message_table.setCellWidget(row, 4, schedule_button)
+
+            stop_button = QPushButton("Parar")
+            stop_button.setFixedSize(100, 30)
+            stop_button.setStyleSheet("""
+                QPushButton {
+                    background-color: #ef4444;
+                    color: white;
+                    border-radius: 4px;
+                    min-height: 30px;
+                    min-width: 100px;
+                }
+            """)
+            stop_button.clicked.connect(lambda _, r=row: self.stop_periodic_message(r))
+            self.message_table.setCellWidget(row, 5, stop_button)
+
+        # Ajuste colunas
+        self.message_table.setColumnWidth(0, 250)  # Mensagem
+        self.message_table.setColumnWidth(1, 100)  # Prioridade
+        self.message_table.setColumnWidth(2, 100)  # Tempo
+        self.message_table.setColumnWidth(3, 120)  # Status
+        self.message_table.setColumnWidth(4, 110)  # Agendar
+        self.message_table.setColumnWidth(5, 110)  # Parar
+
+    # Mantenha os outros métodos inalterados
+    def set_volume(self, value):
+        volume = value / 100.0
+        self.audio_player.set_radio_volume(volume)
+
+    def play_audio(self):
+        self.audio_player.play_audio()
+
+    def pause_audio(self):
+        self.audio_player.pause_audio()
+
+    def schedule_message(self, row):
+        try:
+            message = self.message_table.item(row, 0).text()
+            priority = self.message_table.cellWidget(row, 1).value()
+            delay = self.message_table.cellWidget(row, 2).value()
+            interval = delay if delay > 0 else 0
+
+            full_path = os.path.join(r"C:\Users\Detel\PycharmProjects\Radio1\messages", message)
+            self.audio_player.play_message(full_path, priority, delay, interval)
+
+            status_item = self.message_table.item(row, 3)
+            status_text = f"Periódico ({interval}s)" if interval > 0 else f"Agendado (Delay: {delay}s)"
+            status_item.setText(status_text)
+
+        except Exception as e:
+            logging.error(f"Erro ao agendar mensagem: {e}")
+
+    def stop_periodic_message(self, row):
+        message = self.message_table.item(row, 0).text()
+        full_path = os.path.join(r"C:\Users\Detel\PycharmProjects\Radio1\messages", message)
+        self.audio_player.stop_periodic_message(full_path)
+
+        status_item = self.message_table.item(row, 3)
+        status_item.setText("Não agendado")
+
+    def closeEvent(self, event):
+        self.audio_player.cleanup()
+        event.accept()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+    window = RadioPlayerWindow()
+    window.show()
+    sys.exit(app.exec())
